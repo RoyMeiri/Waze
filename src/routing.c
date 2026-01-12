@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <math.h>
 #include <float.h>
+#include <string.h>
 #include "graph.h"
 #include "min_heap.h"
 #include "routing.h"
@@ -244,4 +245,176 @@ void find_route_a_star(Graph* graph, int start_id, int target_id)
 
     free(g_score); free(f_score); free(parent);
     freeMinHeap(minHeap);
+}
+
+/* Helper: find edge_id for directed edge from 'from' to 'to'. Returns -1 if not found. */
+static int find_edge_id(Graph* g, int from, int to)
+{
+    EdgeNode* cur = g->nodes[from].out_edges;
+    while (cur) {
+        int eid = cur->edge_id;
+        if (eid >= 0 && eid < g->num_edges && g->edges[eid].to_node == to) {
+            return eid;
+        }
+        cur = cur->next;
+    }
+    return -1;
+}
+
+/**
+ * A* variant that returns cost and edge path instead of printing.
+ * Returns 0 on success, 1 if no path, non-zero on error.
+ */
+int find_route_a_star_path(Graph* graph,
+                           int start_id,
+                           int target_id,
+                           double* out_cost,
+                           int* out_edges,
+                           int max_edges,
+                           int* out_edge_count)
+{
+    if (!graph || !out_cost || !out_edges || !out_edge_count) return 10;
+
+    if (start_id < 0 || start_id >= graph->num_nodes ||
+        target_id < 0 || target_id >= graph->num_nodes) {
+        return 11;
+    }
+
+    int V = graph->num_nodes;
+
+    double* g_score = (double*)malloc(sizeof(double) * V);
+    double* f_score = (double*)malloc(sizeof(double) * V);
+    int* parent      = (int*)malloc(sizeof(int) * V);
+
+    if (!g_score || !f_score || !parent) {
+        free(g_score); free(f_score); free(parent);
+        return 12;
+    }
+
+    MinHeap* minHeap = createMinHeap(V);
+    if (!minHeap) {
+        free(g_score); free(f_score); free(parent);
+        return 13;
+    }
+
+    for (int i = 0; i < V; i++) {
+        g_score[i] = DBL_MAX;
+        f_score[i] = DBL_MAX;
+        parent[i] = -1;
+
+        minHeap->array[i] = newMinHeapNode(i, DBL_MAX);
+        minHeap->pos[i] = i;
+    }
+    minHeap->size = V;
+
+    g_score[start_id] = 0.0;
+    f_score[start_id] = heuristic(graph, start_id, target_id);
+    decreaseKey(minHeap, start_id, f_score[start_id]);
+
+    int found = 0;
+
+    while (!isEmpty(minHeap)) {
+        MinHeapNode* minNode = extractMin(minHeap);
+        if (!minNode) break;
+
+        int u = minNode->node_id;
+        double u_f = minNode->dist;
+        free(minNode);
+
+        if (u_f == DBL_MAX) break;
+
+        if (u == target_id) {
+            found = 1;
+            break;
+        }
+
+        EdgeNode* curr = graph->nodes[u].out_edges;
+        while (curr != NULL) {
+            int edge_id = curr->edge_id;
+
+            if (edge_id < 0 || edge_id >= graph->num_edges) {
+                curr = curr->next;
+                continue;
+            }
+
+            int v = graph->edges[edge_id].to_node;         /* neighbor */
+            double w = get_edge_weight(graph, edge_id);     /* weight */
+
+            if (v < 0 || v >= V) {
+                curr = curr->next;
+                continue;
+            }
+
+            if (g_score[u] != DBL_MAX) {
+                double tentative_g = g_score[u] + w;
+
+                if (tentative_g < g_score[v]) {
+                    g_score[v] = tentative_g;
+                    double h = heuristic(graph, v, target_id);
+                    f_score[v] = tentative_g + h;
+                    parent[v] = u;
+
+                    if (isInMinHeap(minHeap, v)) {
+                        decreaseKey(minHeap, v, f_score[v]);
+                    }
+                }
+            }
+
+            curr = curr->next;
+        }
+    }
+
+    if (!found) {
+        free(g_score); free(f_score); free(parent);
+        freeMinHeap(minHeap);
+        return 1; /* no path */
+    }
+
+    /* Reconstruct node path from target back to start */
+    int* node_path = (int*)malloc(sizeof(int) * V);
+    if (!node_path) {
+        free(g_score); free(f_score); free(parent);
+        freeMinHeap(minHeap);
+        return 14;
+    }
+
+    int path_len = 0;
+    for (int v = target_id; v != -1; v = parent[v]) {
+        node_path[path_len++] = v;
+    }
+
+    /* Reverse to get start -> target */
+    for (int i = 0; i < path_len / 2; i++) {
+        int tmp = node_path[i];
+        node_path[i] = node_path[path_len - 1 - i];
+        node_path[path_len - 1 - i] = tmp;
+    }
+
+    /* Convert node path to edge ids */
+    int edge_count = 0;
+    for (int i = 0; i < path_len - 1; i++) {
+        int from = node_path[i];
+        int to = node_path[i + 1];
+        int eid = find_edge_id(graph, from, to);
+        if (eid < 0) {
+            /* should not happen if graph is consistent */
+            free(node_path);
+            free(g_score); free(f_score); free(parent);
+            freeMinHeap(minHeap);
+            return 15;
+        }
+        if (edge_count < max_edges) {
+            out_edges[edge_count] = eid;
+        }
+        edge_count++;
+    }
+
+    free(node_path);
+
+    *out_cost = g_score[target_id];
+    *out_edge_count = edge_count;
+
+    free(g_score); free(f_score); free(parent);
+    freeMinHeap(minHeap);
+    return 0;
 }
