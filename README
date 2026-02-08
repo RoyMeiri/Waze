@@ -41,6 +41,7 @@ while dynamically adapting to traffic updates.
 ├── load_test.py             # Parallel load testing client
 ├── Makefile
 └── README.md
+```
 
 ⚠️ The data/ directory is generated locally and ignored by Git.
 
