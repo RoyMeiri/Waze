@@ -1,24 +1,30 @@
-#define _CRT_SECURE_NO_WARNINGS
-
+#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
+
+#include <unistd.h>
+#include <arpa/inet.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+
+#include <pthread.h>
 
 #include "server.h"
 #include "routing.h"
 
-#ifdef _WIN32
-  #include <winsock2.h>
-  #include <ws2tcpip.h>
-  #pragma comment(lib, "Ws2_32.lib")
-#else
-  #include <unistd.h>
-  #include <arpa/inet.h>
-  #include <sys/socket.h>
-  #include <netinet/in.h>
+/* ---------------- configuration ---------------- */
+
+#ifndef ROUTE_WORKERS
+#define ROUTE_WORKERS 8
 #endif
 
-/* ---------- helpers ---------- */
+#ifndef TRAFFIC_WORKERS
+#define TRAFFIC_WORKERS 2
+#endif
+
+/* ---------------- helpers ---------------- */
 
 static void trim_crlf(char* s) {
     size_t n = strlen(s);
@@ -34,11 +40,7 @@ static int recv_line(int client_fd, char* buf, int cap) {
     int pos = 0;
     while (pos < cap - 1) {
         char c;
-#ifdef _WIN32
-        int r = recv((SOCKET)client_fd, &c, 1, 0);
-#else
         int r = (int)recv(client_fd, &c, 1, 0);
-#endif
         if (r == 0) { /* peer closed */
             if (pos == 0) return 0;
             break;
@@ -56,54 +58,150 @@ static int send_all(int client_fd, const char* s) {
     int len = (int)strlen(s);
     int sent = 0;
     while (sent < len) {
-#ifdef _WIN32
-        int r = send((SOCKET)client_fd, s + sent, len - sent, 0);
-#else
         int r = (int)send(client_fd, s + sent, len - sent, 0);
-#endif
         if (r <= 0) return -1;
         sent += r;
     }
     return 0;
 }
 
-/* ---------- protocol handlers ---------- */
+/* ---------------- task + queues ---------------- */
 
-/* TODO: later connect real routing (Dijkstra/A*) and return edges list + eta */
-static void handle_req(Graph* g, int client_fd, int src, int dst) {
+typedef enum {
+    TASK_REQ = 1,
+    TASK_UPD = 2
+} TaskType;
+
+typedef struct Task {
+    TaskType type;
+
+    Graph* g;
+    pthread_rwlock_t* graph_lock;
+
+    int client_fd;
+
+    /* REQ payload */
+    int src;
+    int dst;
+
+    /* UPD payload */
+    int edge_id;
+    double speed;
+
+    /* result */
+    char* response;     /* malloc'ed string to send back */
+    int done;           /* 0/1 */
+
+    pthread_mutex_t mu;
+    pthread_cond_t  cv;
+
+    struct Task* next;
+} Task;
+
+typedef struct {
+    Task* head;
+    Task* tail;
+    pthread_mutex_t mu;
+    pthread_cond_t  cv;
+} TaskQueue;
+
+static void queue_init(TaskQueue* q) {
+    q->head = q->tail = NULL;
+    pthread_mutex_init(&q->mu, NULL);
+    pthread_cond_init(&q->cv, NULL);
+}
+
+static void queue_push(TaskQueue* q, Task* t) {
+    t->next = NULL;
+    pthread_mutex_lock(&q->mu);
+    if (!q->tail) {
+        q->head = q->tail = t;
+    } else {
+        q->tail->next = t;
+        q->tail = t;
+    }
+    pthread_cond_signal(&q->cv);
+    pthread_mutex_unlock(&q->mu);
+}
+
+static Task* queue_pop(TaskQueue* q) {
+    pthread_mutex_lock(&q->mu);
+    while (!q->head) {
+        pthread_cond_wait(&q->cv, &q->mu);
+    }
+    Task* t = q->head;
+    q->head = t->next;
+    if (!q->head) q->tail = NULL;
+    pthread_mutex_unlock(&q->mu);
+    t->next = NULL;
+    return t;
+}
+
+/* Complete a task and wake the waiting client thread */
+static void task_complete(Task* t, char* resp) {
+    pthread_mutex_lock(&t->mu);
+    t->response = resp;
+    t->done = 1;
+    pthread_cond_signal(&t->cv);
+    pthread_mutex_unlock(&t->mu);
+}
+
+static Task* task_create(Graph* g, pthread_rwlock_t* lock, int client_fd) {
+    Task* t = (Task*)calloc(1, sizeof(Task));
+    if (!t) return NULL;
+    t->g = g;
+    t->graph_lock = lock;
+    t->client_fd = client_fd;
+    t->response = NULL;
+    t->done = 0;
+    pthread_mutex_init(&t->mu, NULL);
+    pthread_cond_init(&t->cv, NULL);
+    return t;
+}
+
+static void task_destroy(Task* t) {
+    if (!t) return;
+    free(t->response);
+    pthread_mutex_destroy(&t->mu);
+    pthread_cond_destroy(&t->cv);
+    free(t);
+}
+
+/* ---------------- protocol execution (workers) ---------------- */
+
+static char* build_route_response(Graph* g, int src, int dst) {
     if (src < 0 || src >= g->num_nodes || dst < 0 || dst >= g->num_nodes) {
-        send_all(client_fd, "ERR BAD_NODES\n");
-        return;
+        return strdup("ERR BAD_NODES\n");
     }
 
-    int max_edges = g->num_nodes > 0 ? g->num_nodes : 1; /* path edges <= num_nodes-1 */
+    int max_edges = (g->num_nodes > 0) ? g->num_nodes : 1;
     int* path_edges = (int*)malloc(sizeof(int) * max_edges);
-    if (!path_edges) {
-        send_all(client_fd, "ERR NO_MEM\n");
-        return;
-    }
+    if (!path_edges) return strdup("ERR NO_MEM\n");
 
     double cost = 0.0;
     int edge_count = 0;
     int rc = find_route_a_star_path(g, src, dst, &cost, path_edges, max_edges, &edge_count);
 
     if (rc == 1) {
-        send_all(client_fd, "ERR NO_ROUTE\n");
         free(path_edges);
-        return;
+        return strdup("ERR NO_ROUTE\n");
     }
     if (rc != 0) {
-        send_all(client_fd, "ERR ROUTE_FAIL\n");
         free(path_edges);
-        return;
+        return strdup("ERR ROUTE_FAIL\n");
+    }
+
+    /* Safety: ensure edge_count fits what we allocated */
+    if (edge_count < 0 || edge_count > max_edges) {
+        free(path_edges);
+        return strdup("ERR ROUTE_FAIL\n");
     }
 
     size_t buf_sz = 64 + (size_t)edge_count * 16;
     char* resp = (char*)malloc(buf_sz);
     if (!resp) {
-        send_all(client_fd, "ERR NO_MEM\n");
         free(path_edges);
-        return;
+        return strdup("ERR NO_MEM\n");
     }
 
     int n = snprintf(resp, buf_sz, "ROUTE %.3f %d", cost, edge_count);
@@ -113,27 +211,25 @@ static void handle_req(Graph* g, int client_fd, int src, int dst) {
     if (n > 0 && (size_t)n < buf_sz) {
         snprintf(resp + n, buf_sz - (size_t)n, "\n");
     } else {
-        /* truncated; indicate failure */
-        send_all(client_fd, "ERR ROUTE_FAIL\n");
         free(path_edges);
         free(resp);
-        return;
+        return strdup("ERR ROUTE_FAIL\n");
     }
 
-    send_all(client_fd, resp);
     free(path_edges);
-    free(resp);
+    return resp;
 }
 
-static void handle_upd(Graph* g, int client_fd, int edge_id, double speed) {
+static char* apply_update(Graph* g, int edge_id, double speed) {
     if (edge_id < 0 || edge_id >= g->num_edges) {
-        send_all(client_fd, "ERR BAD_EDGE\n");
-        return;
+        return strdup("ERR BAD_EDGE\n");
     }
     if (speed <= 0.0) {
-        send_all(client_fd, "ERR BAD_SPEED\n");
-        return;
+        return strdup("ERR BAD_SPEED\n");
     }
+
+    const double min_speed = 1e-6;
+    if (speed < min_speed) speed = min_speed;
 
     Edge* e = &g->edges[edge_id];
     const double alpha = (e->observation_count == 0) ? 1.0 : 0.2;
@@ -143,72 +239,177 @@ static void handle_upd(Graph* g, int client_fd, int edge_id, double speed) {
     e->current_travel_time = e->ema_travel_time;
     e->observation_count++;
 
-    send_all(client_fd, "ACK\n");
+    return strdup("ACK\n");
 }
 
-/* parse one line and respond */
-static void handle_line(Graph* g, int client_fd, char* line) {
-    trim_crlf(line);
-    if (line[0] == '\0') {
-        send_all(client_fd, "ERR EMPTY\n");
-        return;
-    }
+/* ---------------- server shared state ---------------- */
 
-    /* REQ <src> <dst> */
-    int src, dst;
-    if (sscanf(line, "REQ %d %d", &src, &dst) == 2) {
-        handle_req(g, client_fd, src, dst);
-        return;
-    }
+typedef struct {
+    Graph* g;
+    pthread_rwlock_t graph_lock;
 
-    /* UPD <edge_id> <speed> */
-    int edge_id;
-    double speed;
-    if (sscanf(line, "UPD %d %lf", &edge_id, &speed) == 2) {
-        handle_upd(g, client_fd, edge_id, speed);
-        return;
-    }
+    TaskQueue routing_q;
+    TaskQueue traffic_q;
 
-    send_all(client_fd, "ERR UNKNOWN_CMD\n");
+    pthread_t routing_workers[ROUTE_WORKERS];
+    pthread_t traffic_workers[TRAFFIC_WORKERS];
+} ServerState;
+
+/* ---------------- worker threads ---------------- */
+
+static void* routing_worker_main(void* arg) {
+    ServerState* st = (ServerState*)arg;
+
+    while (1) {
+        Task* t = queue_pop(&st->routing_q);
+        /* Execute REQ under read lock */
+        pthread_rwlock_rdlock(&st->graph_lock);
+        char* resp = build_route_response(st->g, t->src, t->dst);
+        pthread_rwlock_unlock(&st->graph_lock);
+
+        task_complete(t, resp);
+        /* IMPORTANT: client thread destroys task after sending */
+    }
+    return NULL;
 }
 
-/* ---------- server ---------- */
+static void* traffic_worker_main(void* arg) {
+    ServerState* st = (ServerState*)arg;
+
+    while (1) {
+        Task* t = queue_pop(&st->traffic_q);
+        /* Execute UPD under write lock */
+        pthread_rwlock_wrlock(&st->graph_lock);
+        char* resp = apply_update(st->g, t->edge_id, t->speed);
+        pthread_rwlock_unlock(&st->graph_lock);
+
+        task_complete(t, resp);
+        /* client thread destroys task after sending */
+    }
+    return NULL;
+}
+
+/* ---------------- per-client network thread ---------------- */
+
+typedef struct {
+    ServerState* st;
+    int client_fd;
+} ClientCtx;
+
+static void* client_thread_main(void* arg) {
+    ClientCtx* ctx = (ClientCtx*)arg;
+    ServerState* st = ctx->st;
+    int client_fd = ctx->client_fd;
+
+    fprintf(stderr, "Client connected (fd=%d).\n", client_fd);
+
+    char line[1024];
+    while (1) {
+        int r = recv_line(client_fd, line, (int)sizeof(line));
+        if (r == 0) break;
+        if (r < 0) {
+            fprintf(stderr, "recv error (fd=%d): %s\n", client_fd, strerror(errno));
+            break;
+        }
+
+        trim_crlf(line);
+        if (line[0] == '\0') {
+            send_all(client_fd, "ERR EMPTY\n");
+            continue;
+        }
+
+        Task* t = task_create(st->g, &st->graph_lock, client_fd);
+        if (!t) {
+            send_all(client_fd, "ERR NO_MEM\n");
+            continue;
+        }
+
+        int src, dst;
+        int edge_id;
+        double speed;
+
+        if (sscanf(line, "REQ %d %d", &src, &dst) == 2) {
+            t->type = TASK_REQ;
+            t->src = src;
+            t->dst = dst;
+
+            queue_push(&st->routing_q, t);
+
+        } else if (sscanf(line, "UPD %d %lf", &edge_id, &speed) == 2) {
+            t->type = TASK_UPD;
+            t->edge_id = edge_id;
+            t->speed = speed;
+
+            queue_push(&st->traffic_q, t);
+
+        } else {
+            task_destroy(t);
+            send_all(client_fd, "ERR UNKNOWN_CMD\n");
+            continue;
+        }
+
+        /* Wait for worker to finish this task (preserves per-connection order) */
+        pthread_mutex_lock(&t->mu);
+        while (!t->done) {
+            pthread_cond_wait(&t->cv, &t->mu);
+        }
+        char* resp = t->response;
+        pthread_mutex_unlock(&t->mu);
+
+        if (resp) {
+            send_all(client_fd, resp);
+        } else {
+            send_all(client_fd, "ERR INTERNAL\n");
+        }
+
+        task_destroy(t);
+    }
+
+    fprintf(stderr, "Client disconnected (fd=%d).\n", client_fd);
+    close(client_fd);
+    free(ctx);
+    return NULL;
+}
+
+/* ---------------- server_run ---------------- */
 
 int server_run(Graph* g, int port) {
-#ifdef _WIN32
-    WSADATA wsa;
-    if (WSAStartup(MAKEWORD(2,2), &wsa) != 0) {
-        fprintf(stderr, "WSAStartup failed\n");
-        return 1;
-    }
-#endif
+    ServerState st;
+    memset(&st, 0, sizeof(st));
+    st.g = g;
 
-    int listen_fd;
+    queue_init(&st.routing_q);
+    queue_init(&st.traffic_q);
 
-#ifdef _WIN32
-    listen_fd = (int)socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if ((SOCKET)listen_fd == INVALID_SOCKET) {
-        fprintf(stderr, "socket() failed\n");
-        WSACleanup();
-        return 2;
+    if (pthread_rwlock_init(&st.graph_lock, NULL) != 0) {
+        fprintf(stderr, "pthread_rwlock_init failed\n");
+        return 5;
     }
-#else
-    listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+
+    /* Start worker pools */
+    for (int i = 0; i < ROUTE_WORKERS; i++) {
+        if (pthread_create(&st.routing_workers[i], NULL, routing_worker_main, &st) != 0) {
+            fprintf(stderr, "pthread_create routing worker failed\n");
+            return 6;
+        }
+        pthread_detach(st.routing_workers[i]);
+    }
+    for (int i = 0; i < TRAFFIC_WORKERS; i++) {
+        if (pthread_create(&st.traffic_workers[i], NULL, traffic_worker_main, &st) != 0) {
+            fprintf(stderr, "pthread_create traffic worker failed\n");
+            return 7;
+        }
+        pthread_detach(st.traffic_workers[i]);
+    }
+
+    int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (listen_fd < 0) {
         perror("socket");
         return 2;
     }
-#endif
 
-    /* reuse addr (best-effort on windows) */
-    {
-        int opt = 1;
-#ifdef _WIN32
-        setsockopt((SOCKET)listen_fd, SOL_SOCKET, SO_REUSEADDR, (const char*)&opt, sizeof(opt));
-#else
-        setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-#endif
-    }
+    int opt = 1;
+    setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
@@ -216,81 +417,50 @@ int server_run(Graph* g, int port) {
     addr.sin_port = htons((unsigned short)port);
     addr.sin_addr.s_addr = htonl(INADDR_ANY);
 
-#ifdef _WIN32
-    if (bind((SOCKET)listen_fd, (struct sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR) {
-        fprintf(stderr, "bind() failed\n");
-        closesocket((SOCKET)listen_fd);
-        WSACleanup();
-        return 3;
-    }
-    if (listen((SOCKET)listen_fd, 64) == SOCKET_ERROR) {
-        fprintf(stderr, "listen() failed\n");
-        closesocket((SOCKET)listen_fd);
-        WSACleanup();
-        return 4;
-    }
-#else
     if (bind(listen_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
         perror("bind");
         close(listen_fd);
         return 3;
     }
+
     if (listen(listen_fd, 64) < 0) {
         perror("listen");
         close(listen_fd);
         return 4;
     }
-#endif
 
     fprintf(stderr, "Server listening on port %d...\n", port);
 
-    /* Sequential event loop: accept -> read lines -> respond */
     while (1) {
         struct sockaddr_in client_addr;
-#ifdef _WIN32
-        int client_len = sizeof(client_addr);
-        SOCKET client = accept((SOCKET)listen_fd, (struct sockaddr*)&client_addr, &client_len);
-        if (client == INVALID_SOCKET) {
-            fprintf(stderr, "accept() failed\n");
-            continue;
-        }
-        int client_fd = (int)client;
-#else
         socklen_t client_len = sizeof(client_addr);
         int client_fd = accept(listen_fd, (struct sockaddr*)&client_addr, &client_len);
         if (client_fd < 0) {
             perror("accept");
             continue;
         }
-#endif
 
-        fprintf(stderr, "Client connected.\n");
-
-        char line[1024];
-        while (1) {
-            int r = recv_line(client_fd, line, (int)sizeof(line));
-            if (r == 0) break;     /* closed */
-            if (r < 0) {
-                fprintf(stderr, "recv error\n");
-                break;
-            }
-            handle_line(g, client_fd, line);
+        ClientCtx* ctx = (ClientCtx*)malloc(sizeof(ClientCtx));
+        if (!ctx) {
+            fprintf(stderr, "malloc failed\n");
+            close(client_fd);
+            continue;
         }
+        ctx->st = &st;
+        ctx->client_fd = client_fd;
 
-        fprintf(stderr, "Client disconnected.\n");
-#ifdef _WIN32
-        closesocket((SOCKET)client_fd);
-#else
-        close(client_fd);
-#endif
+        pthread_t tid;
+        if (pthread_create(&tid, NULL, client_thread_main, ctx) != 0) {
+            fprintf(stderr, "pthread_create client thread failed\n");
+            close(client_fd);
+            free(ctx);
+            continue;
+        }
+        pthread_detach(tid);
     }
 
-    /* unreachable in this version */
-#ifdef _WIN32
-    closesocket((SOCKET)listen_fd);
-    WSACleanup();
-#else
+    /* Unreachable in this assignment version */
     close(listen_fd);
-#endif
+    pthread_rwlock_destroy(&st.graph_lock);
     return 0;
 }

@@ -1,14 +1,18 @@
 CC = gcc
-CFLAGS = -Wall -Wextra -std=c11 -Iinclude
-LDFLAGS = -lm
+CFLAGS = -Wall -Wextra -std=c11 -O2
+LDFLAGS = -lm -pthread
 
 SRC = \
-    src/graph/graph.c \
-    src/routing/routing.c \
-    src/util/min_heap.c \
-    src/tests/test_all.c
+    src/main.c \
+    src/server.c \
+    src/graph_loader.c \
+    src/graph.c \
+    src/routing.c \
+    src/min_heap.c
 
-TARGET = test_all
+TARGET = server
+
+.PHONY: all run clean
 
 all: $(TARGET)
 
