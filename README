@@ -1,7 +1,8 @@
 # 🚗 **Concurrent Routing Server (Waze)**
 
 A multithreaded routing server written in **C**, inspired by Waze-style navigation systems.
-The server maintains a directed road graph, supports concurrent clients, and computes shortest paths using the **A/*** algorithm while dynamically adapting to traffic updates.
+The server maintains a directed road graph, supports concurrent clients, and computes shortest paths using the **A\*** algorithm
+while dynamically adapting to traffic updates.
 
 ---
 
@@ -23,6 +24,7 @@ The server maintains a directed road graph, supports concurrent clients, and com
 
 ## 📁 **Project Structure**
 
+```text
 .
 ├── src/
 │   ├── main.c               # Server entry point
