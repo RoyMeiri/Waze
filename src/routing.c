@@ -397,16 +397,20 @@ int find_route_a_star_path(Graph* graph,
         int to = node_path[i + 1];
         int eid = find_edge_id(graph, from, to);
         if (eid < 0) {
-            /* should not happen if graph is consistent */
             free(node_path);
             free(g_score); free(f_score); free(parent);
             freeMinHeap(minHeap);
             return 15;
         }
-        if (edge_count < max_edges) {
-            out_edges[edge_count] = eid;
+
+        if (edge_count >= max_edges) {
+            free(node_path);
+            free(g_score); free(f_score); free(parent);
+            freeMinHeap(minHeap);
+            return 16; /* path too long for out_edges capacity */
         }
-        edge_count++;
+
+        out_edges[edge_count++] = eid;
     }
 
     free(node_path);

@@ -125,7 +125,6 @@ static void handle_req(Graph* g, int client_fd, int src, int dst) {
     free(resp);
 }
 
-/* TODO: later apply EMA update to edge current_travel_time */
 static void handle_upd(Graph* g, int client_fd, int edge_id, double speed) {
     if (edge_id < 0 || edge_id >= g->num_edges) {
         send_all(client_fd, "ERR BAD_EDGE\n");
@@ -136,9 +135,14 @@ static void handle_upd(Graph* g, int client_fd, int edge_id, double speed) {
         return;
     }
 
-    /* Minimal “acknowledge only” for now */
-    /* Later: compute T_measured = length/speed and update current_travel_time with EMA */
-    (void)g;
+    Edge* e = &g->edges[edge_id];
+    const double alpha = (e->observation_count == 0) ? 1.0 : 0.2;
+    double measured = e->base_length / speed;
+
+    e->ema_travel_time = alpha * measured + (1.0 - alpha) * e->ema_travel_time;
+    e->current_travel_time = e->ema_travel_time;
+    e->observation_count++;
+
     send_all(client_fd, "ACK\n");
 }
 
