@@ -1,30 +1,24 @@
-# 🚗 **Concurrent Routing Server (Waze)**
+# 🚗 Concurrent Routing Server (Waze)
 
 A multithreaded routing server written in **C**, inspired by Waze-style navigation systems.
-The server maintains a directed road graph, supports concurrent clients, and computes shortest paths using the **A\*** algorithm
-while dynamically adapting to traffic updates.
+The server maintains a directed road graph, supports concurrent clients, and computes shortest paths using the **A\*** algorithm while dynamically adapting to traffic updates.
 
 ---
 
-## ✨ **Features**
+## ✨ Features
 
-⚡ **Concurrent TCP server** (one thread per client)
-
-🧭 **A* shortest-path routing** with geometric heuristic
-
-🚦 **Live traffic updates** using Exponential Moving Average (EMA)
-
-🔐 **Thread-safe graph** access with reader–writer locks
-
-🧪 **Synthetic graph generation** for scalable testing
-
-📈 **Parallel load testing client**
+- ⚡ **Concurrent TCP server** (one thread per client)
+- 🧭 **A* shortest-path routing** with geometric heuristic
+- 🚦 **Live traffic updates** using Exponential Moving Average (EMA)
+- 🔐 **Thread-safe graph** access with reader–writer locks
+- 🧪 **Synthetic graph generation** for scalable testing
+- 📈 **Parallel load testing client**
 
 ---
 
-## 📁 **Project Structure**
+## 📁 Project Structure
 
-```text
+```
 .
 ├── src/
 │   ├── main.c               # Server entry point
@@ -43,13 +37,14 @@ while dynamically adapting to traffic updates.
 └── README.md
 ```
 
-⚠️ The data/ directory is generated locally and ignored by Git.
+⚠️ The `data/` directory is generated locally and ignored by Git.
 
 ---
 
-## 🛠️ **Compilation & Execution**
+## 🛠️ Compilation & Execution
 
 From the project root:
+
 ```bash
 make
 ./server
@@ -61,28 +56,31 @@ Or simply:
 make run
 ```
 
-📡 The server listens on **TCP port 8080**
-📂 Graph data is loaded from the data/ directory at startup
+- 📡 The server listens on **TCP port 8080**
+- 📂 Graph data is loaded from the `data/` directory at startup
 
 ---
 
-## 📊 **Graph Input Format**
+## 📊 Graph Input Format
 
-The server expects the following files inside data/:
+The server expects the following files inside `data/`:
 
-graph.meta
-```bash
+### graph.meta
+
+```
 num_nodes <N>
 num_edges <M>
 ```
 
-nodes.csv
-```bash
+### nodes.csv
+
+```
 node_id,x,y
 ```
 
-edges.csv
-```bash
+### edges.csv
+
+```
 edge_id,from_node,to_node,base_length,base_speed_limit
 ```
 
@@ -90,7 +88,7 @@ The graph is directed. Node coordinates are used for the A* heuristic.
 
 ---
 
-## 🧬 **Generating Graph Data**
+## 🧬 Generating Graph Data
 
 A Python script is provided to generate synthetic graphs for testing.
 
@@ -100,14 +98,14 @@ Example (1000 nodes, 3000 edges):
 ./generate_graph.py --nodes 1000 --edges 3000
 ```
 
-This generates graph.meta, nodes.csv, and edges.csv directly in the data/ directory.
+This generates `graph.meta`, `nodes.csv`, and `edges.csv` directly in the `data/` directory.
 
 ---
 
-## 🔌 **Client Protocol**
+## 🔌 Client Protocol
 
 The server uses a simple **line-based TCP protocol**.
-Clients may connect using standard tools such as nc (netcat):
+Clients may connect using standard tools such as `nc` (netcat):
 
 ```bash
 nc 127.0.0.1 8080
@@ -115,30 +113,31 @@ nc 127.0.0.1 8080
 
 ### 🧭 Routing Request
 
-```bash
+```
 REQ <source_node> <destination_node>
 ```
 
 ✅ Response on success:
-```bash
+
+```
 ROUTE <total_cost> <edge_count> <edge_id_1> <edge_id_2> ...
 ```
 
 ❌ If no route exists:
 
-```bash
+```
 ERR NO_ROUTE
 ```
 
 ### 🚦 Traffic Update
 
-```bash
+```
 UPD <edge_id> <speed>
 ```
 
 Response:
 
-```bash
+```
 ACK
 ```
 
@@ -146,28 +145,21 @@ Traffic updates adjust the travel time using an **EMA**.
 
 ---
 
+## 🧵 Concurrency Model
 
-## 🧵 **Concurrency Model**
-
-Each client connection runs in its **own thread**
-
-Routing requests (REQ) acquire a **read lock**
-
-Traffic updates (UPD) acquire a **write lock**
-
-Shared graph data is protected by a global
-pthread_rwlock_t
+- Each client connection runs in its **own thread**
+- Routing requests (REQ) acquire a **read lock**
+- Traffic updates (UPD) acquire a **write lock**
+- Shared graph data is protected by a global `pthread_rwlock_t`
 
 This allows:
 
-Multiple routing queries to run in parallel
-
-Safe and consistent traffic updates
-
+- Multiple routing queries to run in parallel
+- Safe and consistent traffic updates
 
 ---
 
-## 📈 **Load Testing**
+## 📈 Load Testing
 
 A Python-based load test client is provided:
 
@@ -177,19 +169,17 @@ python3 load_test.py --num-nodes <N> --num-edges <M>
 
 The load test issues concurrent routing and update requests to verify correctness and stability under parallel load.
 
+---
+
+## 📝 Notes
+
+- The graph is directed; some routes may not exist
+- All graph operations are thread-safe
+- Designed to remain stable under concurrent read/write workloads
 
 ---
 
-## 📝 **Notes**
+## 👨‍💻 Authors
 
-The graph is directed; some routes may not exist
-
-All graph operations are thread-safe
-
-Designed to remain stable under concurrent read/write workloads
-
----
-
-## 👨‍💻 **Authors**
-**Eliron Picard**
-**Roy Meiri**
+- **Eliron Picard**
+- **Roy Meiri**
